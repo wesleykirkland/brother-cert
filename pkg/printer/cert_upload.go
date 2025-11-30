@@ -8,10 +8,85 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"regexp"
 	"time"
 )
 
 const urlCertImport = "/net/security/certificate/import.html"
+
+// importFormFields holds the dynamically discovered form field names for the import page
+type importFormFields struct {
+	hiddenField1  string // first hidden field (e.g., B8ea or Bb0a)
+	hiddenField2  string // second hidden field (e.g., B8f8 or Bb18)
+	fileField     string // file input field (e.g., B820 or Ba40)
+	passwordField string // password field (e.g., B821 or Ba41)
+}
+
+// parseImportFormFields extracts the form field names from the import page HTML
+func parseImportFormFields(bodyBytes []byte) (*importFormFields, error) {
+	fields := &importFormFields{}
+
+	// Find hidden fields that are NOT CSRFToken, pageid, or hidden_certificate_process_control
+	// Pattern: <input type="hidden" id="Bb0a" name="Bb0a" value="" />
+	hiddenRegex := regexp.MustCompile(`<input[^>]+type="hidden"[^>]+(?:id="([^"]+)"[^>]+name="([^"]+)"|name="([^"]+)"[^>]+id="([^"]+)")[^>]*value=""[^>]*>`)
+	hiddenMatches := hiddenRegex.FindAllSubmatch(bodyBytes, -1)
+
+	hiddenFields := []string{}
+	for _, match := range hiddenMatches {
+		var fieldName string
+		if len(match[1]) > 0 {
+			fieldName = string(match[1])
+		} else if len(match[3]) > 0 {
+			fieldName = string(match[3])
+		}
+
+		// Skip known fields
+		if fieldName != "" && fieldName != "CSRFToken" && fieldName != "CSRFToken1" &&
+			fieldName != "pageid" && fieldName != "hidden_certificate_process_control" &&
+			fieldName != "hidden_cert_import_password" {
+			hiddenFields = append(hiddenFields, fieldName)
+		}
+	}
+
+	if len(hiddenFields) >= 2 {
+		fields.hiddenField1 = hiddenFields[0]
+		fields.hiddenField2 = hiddenFields[1]
+	}
+
+	// Find file input field
+	// Pattern: <input type="file" ... id="Ba40" name="Ba40" ... />
+	fileRegex := regexp.MustCompile(`<input[^>]+type="file"[^>]+(?:id="([^"]+)"|name="([^"]+)")[^>]*>`)
+	fileMatch := fileRegex.FindSubmatch(bodyBytes)
+	if len(fileMatch) >= 2 {
+		if len(fileMatch[1]) > 0 {
+			fields.fileField = string(fileMatch[1])
+		} else if len(fileMatch[2]) > 0 {
+			fields.fileField = string(fileMatch[2])
+		}
+	}
+
+	// Find password input field
+	// Pattern: <input type="password" ... id="Ba41" name="Ba41" ... />
+	passwordRegex := regexp.MustCompile(`<input[^>]+type="password"[^>]+(?:id="([^"]+)"|name="([^"]+)")[^>]*>`)
+	passwordMatch := passwordRegex.FindSubmatch(bodyBytes)
+	if len(passwordMatch) >= 2 {
+		if len(passwordMatch[1]) > 0 {
+			fields.passwordField = string(passwordMatch[1])
+		} else if len(passwordMatch[2]) > 0 {
+			fields.passwordField = string(passwordMatch[2])
+		}
+	}
+
+	// Validate we found required fields
+	if fields.fileField == "" {
+		return nil, errors.New("printer: upload: failed to find file input field name")
+	}
+	if fields.passwordField == "" {
+		return nil, errors.New("printer: upload: failed to find password input field name")
+	}
+
+	return fields, nil
+}
 
 // UploadNewCert converts the specified pem files into p12 format and installs them
 // on the printer. It returns the id value of the newly installed cert.
@@ -65,6 +140,12 @@ func (p *printer) UploadNewCert(keyPem, certPem []byte) (string, error) {
 		return "", err
 	}
 
+	// parse form field names from the import page HTML
+	formFields, err := parseImportFormFields(bodyBytes)
+	if err != nil {
+		return "", err
+	}
+
 	// make writer for multipart/form-data submission
 	var formDataBuffer bytes.Buffer
 	formWriter := multipart.NewWriter(&formDataBuffer)
@@ -80,14 +161,19 @@ func (p *printer) UploadNewCert(keyPem, certPem []byte) (string, error) {
 		return "", fmt.Errorf("printer: upload: failed to write form (%w)", err)
 	}
 
-	err = formWriter.WriteField("B8ea", "")
-	if err != nil {
-		return "", fmt.Errorf("printer: upload: failed to write form (%w)", err)
+	// write dynamic hidden fields if found
+	if formFields.hiddenField1 != "" {
+		err = formWriter.WriteField(formFields.hiddenField1, "")
+		if err != nil {
+			return "", fmt.Errorf("printer: upload: failed to write form (%w)", err)
+		}
 	}
 
-	err = formWriter.WriteField("B8f8", "")
-	if err != nil {
-		return "", fmt.Errorf("printer: upload: failed to write form (%w)", err)
+	if formFields.hiddenField2 != "" {
+		err = formWriter.WriteField(formFields.hiddenField2, "")
+		if err != nil {
+			return "", fmt.Errorf("printer: upload: failed to write form (%w)", err)
+		}
 	}
 
 	err = formWriter.WriteField("hidden_certificate_process_control", "1")
@@ -95,7 +181,8 @@ func (p *printer) UploadNewCert(keyPem, certPem []byte) (string, error) {
 		return "", fmt.Errorf("printer: upload: failed to write form (%w)", err)
 	}
 
-	p12W, err := formWriter.CreateFormFile("B820", "certkey.p12")
+	// use dynamically discovered file field name
+	p12W, err := formWriter.CreateFormFile(formFields.fileField, "certkey.p12")
 	if err != nil {
 		return "", fmt.Errorf("printer: upload: failed to write form (%w)", err)
 	}
@@ -105,7 +192,8 @@ func (p *printer) UploadNewCert(keyPem, certPem []byte) (string, error) {
 		return "", fmt.Errorf("printer: upload: failed to write form (%w)", err)
 	}
 
-	err = formWriter.WriteField("B821", "")
+	// use dynamically discovered password field name
+	err = formWriter.WriteField(formFields.passwordField, "")
 	if err != nil {
 		return "", fmt.Errorf("printer: upload: failed to write form (%w)", err)
 	}

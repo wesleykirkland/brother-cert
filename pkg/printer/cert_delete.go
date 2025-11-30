@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -13,6 +14,46 @@ import (
 const urlCertDelete = "/net/security/certificate/delete.html"
 
 var errCertDeleteInvalidID = errors.New("printer: cant delete cert (invalid id)")
+
+// deleteFormFields holds the dynamically discovered form field names for the delete page
+type deleteFormFields struct {
+	hiddenField1 string // first hidden field (e.g., B8ea or Bb0a)
+	hiddenField2 string // second hidden field (e.g., B8fc or Bb1c)
+}
+
+// parseDeleteFormFields extracts the form field names from the delete page HTML
+func parseDeleteFormFields(bodyBytes []byte) (*deleteFormFields, error) {
+	fields := &deleteFormFields{}
+
+	// Find hidden fields that are NOT CSRFToken, pageid, hidden_certificate_process_control, or hidden_certificate_idx
+	// Pattern: <input type="hidden" id="Bb0a" name="Bb0a" value="" />
+	hiddenRegex := regexp.MustCompile(`<input[^>]+type="hidden"[^>]+(?:id="([^"]+)"[^>]+name="([^"]+)"|name="([^"]+)"[^>]+id="([^"]+)")[^>]*value=""[^>]*>`)
+	hiddenMatches := hiddenRegex.FindAllSubmatch(bodyBytes, -1)
+
+	hiddenFields := []string{}
+	for _, match := range hiddenMatches {
+		var fieldName string
+		if len(match[1]) > 0 {
+			fieldName = string(match[1])
+		} else if len(match[3]) > 0 {
+			fieldName = string(match[3])
+		}
+
+		// Skip known fields
+		if fieldName != "" && fieldName != "CSRFToken" && fieldName != "CSRFToken1" &&
+			fieldName != "pageid" && fieldName != "hidden_certificate_process_control" &&
+			fieldName != "hidden_certificate_idx" {
+			hiddenFields = append(hiddenFields, fieldName)
+		}
+	}
+
+	if len(hiddenFields) >= 2 {
+		fields.hiddenField1 = hiddenFields[0]
+		fields.hiddenField2 = hiddenFields[1]
+	}
+
+	return fields, nil
+}
 
 // DeleteCert deletes the certificate with the specified ID from the
 // printer
@@ -80,13 +121,24 @@ func (p *printer) DeleteCert(id string) error {
 		return err
 	}
 
+	// parse form field names from the delete page HTML
+	formFields, err := parseDeleteFormFields(bodyBytes)
+	if err != nil {
+		return err
+	}
+
 	// first delete form
 	// form values
 	data := url.Values{}
 	data.Set("pageid", "383")
 	data.Set("CSRFToken", csrfToken)
-	data.Set("B8ea", "")
-	data.Set("B8fc", "")
+	// use dynamically discovered hidden field names
+	if formFields.hiddenField1 != "" {
+		data.Set(formFields.hiddenField1, "")
+	}
+	if formFields.hiddenField2 != "" {
+		data.Set(formFields.hiddenField2, "")
+	}
 	data.Set("hidden_certificate_process_control", "1")
 	data.Set("hidden_certificate_idx", id)
 
@@ -128,13 +180,24 @@ func (p *printer) DeleteCert(id string) error {
 		return err
 	}
 
+	// parse form field names from the confirmation page HTML
+	confirmFormFields, err := parseDeleteFormFields(bodyBytes)
+	if err != nil {
+		return err
+	}
+
 	// second delete (confirmation) form
 	// form values
 	data = url.Values{}
 	data.Set("pageid", "383")
 	data.Set("CSRFToken", csrfToken)
-	data.Set("B8ea", "")
-	data.Set("B8eb", "")
+	// use dynamically discovered hidden field names from confirmation page
+	if confirmFormFields.hiddenField1 != "" {
+		data.Set(confirmFormFields.hiddenField1, "")
+	}
+	if confirmFormFields.hiddenField2 != "" {
+		data.Set(confirmFormFields.hiddenField2, "")
+	}
 	data.Set("hidden_certificate_process_control", "2")
 	data.Set("hidden_certificate_idx", id)
 
